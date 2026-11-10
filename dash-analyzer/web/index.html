@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Melbourne Dash Analyzer</title>
+<link rel="stylesheet"
+ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: system-ui, sans-serif;
+  background: #101827; color: #e5e7eb;
+}
+header {
+  padding: 15px 22px; background: #172338;
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 15px; flex-wrap: wrap;
+}
+h1 { font-size: 19px; margin: 0; }
+a { color: #93c5fd; }
+small { color: #9ca3af; }
+button {
+  background: #2563eb; color: white; border: 0;
+  border-radius: 7px; padding: 10px 14px; cursor: pointer;
+}
+button:disabled { opacity: .5; cursor: wait; }
+main { display: flex; height: calc(100vh - 95px); }
+aside {
+  width: 330px; overflow-y: auto; padding: 18px;
+  background: #111c2e; flex-shrink: 0;
+}
+#map { flex: 1; min-width: 0; }
+.zone {
+  padding: 12px; border: 1px solid #334155;
+  border-radius: 8px; margin: 9px 0; cursor: pointer;
+}
+.zone:hover { background: #25354b; }
+.score { color: #4ade80; font-weight: bold; }
+label { display: block; margin: 15px 0 5px; }
+select { padding: 7px; max-width: 100%; }
+input { max-width: 100%; padding: 7px; }
+input[type=range] { width: 100%; }
+#status { font-size: 13px; color: #cbd5e1; }
+footer {
+  padding: 7px 20px; font-size: 12px;
+  color: #94a3b8; background: #172338;
+}
+@media(max-width:700px) {
+  main { flex-direction: column-reverse; height: auto; }
+  #map { height: 55vh; flex: none; }
+  aside { width: 100%; height: 40vh; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Melbourne Dash Analyzer</h1>
+    <small>Food and grocery opportunity heatmap · Car delivery</small>
+  </div>
+  <button id="refresh">Refresh OSM Data</button>
+</header>
+
+<main>
+  <aside>
+    <h3>Where should I drive now?</h3>
+    <p><small>Use “Select location on map”, then click within Melbourne coverage.</small></p>
+    <button id="locate">Use my location</button>
+    <button id="select-location" aria-pressed="false">Select location on map</button>
+    <label>Latitude <input id="lat" type="number" step="any" value="-37.8136"></label>
+    <label>Longitude <input id="lon" type="number" step="any" value="144.9631"></label>
+    <label>Fuel AUD/litre <input id="fuel" type="number" min="0" max="10" step="0.01" value="2"></label>
+    <label>Consumption L/100km <input id="consumption" type="number" min="0" max="40" step="0.1" value="8"></label>
+    <button id="calculate">Update recommendations</button>
+    <p id="weather"></p><p id="analytics"></p>
+    <details><summary>Log completed delivery / work block</summary>
+    <p>Include waiting and repositioning time and kilometres for useful hourly results. Avoid overlapping entries.</p>
+    <form id="delivery">
+    <label>Start <input name="started_at" type="datetime-local" required></label>
+    <label>End <input name="ended_at" type="datetime-local" required></label>
+    <label>Gross AUD <input name="gross_aud" type="number" min="0" step="0.01" required></label>
+    <label>Total km <input name="distance_km" type="number" min="0" step="0.1" required></label>
+    <label>Fuel cost AUD <input name="fuel_cost_aud" type="number" min="0" step="0.01" required></label>
+    <label>Other costs AUD <input name="other_cost_aud" type="number" min="0" step="0.01" value="0" required></label>
+    <button>Save entry</button></form><p id="saved" role="status"></p><div id="history"></div></details>
+    <p id="status">Loading...</p>
+
+    <label for="day">Day (Australia/Melbourne)</label>
+<select id="day"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>
+<label for="hour">Hour: <span id="hour-label"></span>:00</label>
+<input id="hour" type="range" min="0" max="23" step="1">
+<details open>
+    <summary>Scoring settings</summary>
+    <label for="radius">Range from location (km)</label>
+    <input id="radius" type="number" min="0" max="100" step="0.1" value="5">
+    <small>0 = all cached coverage. Range uses straight-line distance to each venue.</small>
+    <label><input id="ignore-distance" type="checkbox"> Ignore distance in scoring</label>
+    <small>Removes distance and relocation fuel penalties from rankings. Estimated travel and fuel are still displayed.</small>
+    <label for="parking">
+      CBD parking penalty: <span id="penalty">65%</span>
+    </label>
+    <input id="parking" type="range" min="0" max="100" value="65">
+    </details>
+
+    <label><input id="grocery" type="checkbox"> Include grocery shops</label>
+    <small>Supermarkets, convenience stores and grocery shops use a 2× base scoring weight (a planning preference, not measured demand). Refresh OSM to populate existing caches. Platform participation is unknown.</small>
+
+    <details open>
+      <summary>Google Maps data within 5 km</summary>
+      <p><small>Collect busy times and opening hours for cached food and grocery venues around your chosen location. Matching requires a compatible name, nearby place coordinates and a unique result. Missing or ambiguous results stay unavailable. Collection may take a long time; progress continues while you use the map.</small></p>
+      <button id="maps-collect">Collect within 5 km</button>
+      <button id="maps-cancel" disabled>Cancel collection</button>
+      <button id="maps-cached">View cached data</button>
+      <p id="maps-progress" role="status"></p>
+      <p id="maps-coverage"></p>
+      <div id="maps-results"></div>
+    </details>
+
+    <label for="min-score">Minimum cluster score</label>
+    <select id="min-score">
+      <option value="0">Show all scores</option>
+      <option value="20">20 and above</option>
+      <option value="40">40 and above</option>
+      <option value="60">60 and above</option>
+      <option value="80">80 and above</option>
+    </select>
+    <p id="cluster-count" role="status"></p>
+
+    <label>
+      <input id="markers" type="checkbox">
+      Show individual venues
+    </label>
+
+    <p><small>
+      Rankings estimate venue concentration and takeaway
+      suitability. They do not represent live DoorDash orders,
+      actual driver competition or measured parking availability. Activity is estimated from category, cuisine and OSM hours, not live demand or Google Maps popularity. Confirmed closed venues contribute zero; missing or unsupported hours remain unknown. Travel estimates use straight-line distance × a road factor, not routing or traffic. Stop safely before interacting.
+    </small></p>
+
+    <div id="rankings"></div>
+  </aside>
+  <div id="map"></div>
+</main>
+
+<footer>
+  Weather: <a href="https://open-meteo.com/">Open-Meteo</a> (<a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>) · Data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · Not affiliated with DoorDash
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([-37.8136, 144.9631], 12);
+
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+
+const heatLayer = L.layerGroup().addTo(map);
+const venueLayer = L.layerGroup().addTo(map);
+const locationLayer = L.layerGroup().addTo(map);
+
+const status = document.getElementById('status');
+const rankings = document.getElementById('rankings');
+const parking = document.getElementById('parking');
+const markers = document.getElementById('markers');
+const refresh = document.getElementById('refresh');
+
+let currentVenues = [];
+let currentZones = [];
+const field = id => document.getElementById(id);
+const localParts = Object.fromEntries(new Intl.DateTimeFormat('en-AU',{timeZone:'Australia/Melbourne',weekday:'short',hour:'numeric',hourCycle:'h23'}).formatToParts(new Date()).map(p=>[p.type,p.value]));
+field('day').value = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].indexOf(localParts.weekday);
+field('hour').value = Number(localParts.hour);
+field('hour-label').textContent = field('hour').value;
+field('day').addEventListener('change', load);
+field('hour').addEventListener('input', () => {field('hour-label').textContent=field('hour').value;});
+field('hour').addEventListener('change', load);
+let loadVersion = 0;
+field('calculate').onclick = load;
+function setLocation(lat, lon) {
+  if (lat < -38.05 || lat > -37.55 || lon < 144.65 || lon > 145.35) {
+    status.textContent = 'Choose a location within Melbourne coverage (latitude −38.05 to −37.55, longitude 144.65 to 145.35).';
+    return;
+  }
+  field('lat').value = lat.toFixed(6);
+  field('lon').value = lon.toFixed(6);
+  setSelectingLocation(false);
+  load();
+}
+let selectingLocation = false;
+function setSelectingLocation(active) {
+  selectingLocation = active;
+  field('select-location').textContent = active ? 'Cancel location selection' : 'Select location on map';
+  field('select-location').setAttribute('aria-pressed', String(active));
+  map.getContainer().style.cursor = active ? 'crosshair' : '';
+}
+field('select-location').onclick = () => {
+  setSelectingLocation(!selectingLocation);
+  status.textContent = selectingLocation ? 'Click an empty map area to set your location. Press Escape or Cancel to stop.' : 'Location selection cancelled.';
+};
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && selectingLocation) {
+    setSelectingLocation(false);
+    status.textContent = 'Location selection cancelled.';
+  }
+});
+map.on('click', e => {
+  if (selectingLocation) setLocation(e.latlng.lat, e.latlng.lng);
+});
+field('locate').onclick = () => navigator.geolocation ? navigator.geolocation.getCurrentPosition(p => setLocation(p.coords.latitude,p.coords.longitude),e=>{status.textContent=e.message;}) : status.textContent='Geolocation unavailable; enter coordinates.';
+function renderLocation() {
+  locationLayer.clearLayers();
+  const lat = Number(field('lat').value), lon = Number(field('lon').value);
+  const radius = Number(field('radius').value);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  L.circleMarker([lat,lon], {radius:7,color:'#fff',fillColor:'#f97316',fillOpacity:1,bubblingMouseEvents:false}).bindTooltip('Your selected location').addTo(locationLayer);
+  if (radius > 0) L.circle([lat,lon], {radius:radius*1000,color:'#f97316',fill:false,weight:2,interactive:false}).addTo(locationLayer);
+}
+async function ledger(){
+ try {const [a,ds]=await Promise.all([fetch('/api/analytics').then(r=>r.json()),fetch('/api/deliveries').then(r=>r.json())]);
+ field('analytics').textContent=`Logged net: $${a.net_aud.toFixed(2)} · $${a.net_per_hour.toFixed(2)}/hour · $${a.net_per_km.toFixed(2)}/km (${a.deliveries} entries). Net excludes unlogged costs and time.`;
+ field('history').replaceChildren();for(const d of ds.slice(0,20)){const p=document.createElement('p');p.textContent=`${new Date(d.started_at).toLocaleString()} · $${d.gross_aud.toFixed(2)} · ${d.distance_km} km`;field('history').append(p);}
+ }catch(e){field('analytics').textContent='Ledger unavailable: '+e.message;}
+}
+field('delivery').onsubmit=async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));try{for(const k of Object.keys(data)){data[k]=k.endsWith('_at')?new Date(data[k]).toISOString():Number(data[k]);}const r=await fetch('/api/deliveries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok)throw Error((await r.json()).error);field('saved').textContent='Saved';await ledger();}catch(err){field('saved').textContent=err.message;}};
+ledger();
+
+function color(score) {
+  if (score >= 80) return '#16a34a';
+  if (score >= 60) return '#84cc16';
+  if (score >= 40) return '#facc15';
+  if (score >= 20) return '#fb923c';
+  return '#ef4444';
+}
+
+function renderVenues() {
+  venueLayer.clearLayers();
+  if (!markers.checked) return;
+
+  for (const v of currentVenues) {
+    const marker = L.circleMarker([v.lat, v.lon], {
+      radius: 3, color: ['supermarket','convenience','grocery'].includes(v.type) ? '#a855f7' : '#2563eb',
+      fillOpacity: 0.8, weight: 1, bubblingMouseEvents: false
+    });
+    const title = document.createElement('strong');
+    title.textContent = v.name;
+    const detail = document.createElement('div');
+    detail.textContent = v.type + (v.cuisine ? ' · '+v.cuisine : '') + ' · '+v.activity.status.replaceAll('_',' ') + ' · estimated activity '+v.activity.factor.toFixed(2)+' ('+v.activity.profile+', '+v.activity.confidence+' confidence) · OSM hours: '+(v.opening_hours || 'unknown');
+    const popup = document.createElement('div');
+    popup.append(title, detail);
+    marker.bindPopup(popup);
+    marker.addTo(venueLayer);
+  }
+}
+
+function renderClusters() {
+  const minimum = Number(field('min-score').value);
+  const visibleZones = currentZones.filter(z => z.score >= minimum);
+  heatLayer.clearLayers();
+  rankings.replaceChildren();
+  field('cluster-count').textContent = `Showing ${visibleZones.length} of ${currentZones.length} clusters`;
+  if (visibleZones.length === 0) {
+    rankings.textContent = currentZones.length ? 'No clusters meet this minimum score. Lower the minimum to see more.' : 'No clusters available.';
+  }
+    for (const z of visibleZones) {
+      const circle = L.circle([z.lat, z.lon], {
+        radius: 650,
+        color: color(z.score),
+        fillColor: color(z.score),
+        fillOpacity: 0.24,
+        weight: 1, bubblingMouseEvents: false
+      }).addTo(heatLayer);
+
+      circle.bindPopup(
+        'Opportunity score: ' + z.score + '/100' +
+        '<br>Estimated activity: '+z.activity_score.toFixed(2)+' · '+z.confidence+' confidence'+
+        '<br>Open / closed / unknown hours: '+z.confirmed_open+' / '+z.confirmed_closed+' / '+z.unknown_hours+
+        '<br>Venues: ' + z.venues + '<br>Estimated road km: '+z.estimated_road_km.toFixed(1)
+      );
+    }
+
+    for (const [i, z] of visibleZones.slice(0, 20).entries()) {
+      const item = document.createElement('div');
+      item.className = 'zone';
+
+      const heading = document.createElement('strong');
+      heading.textContent = '#' + (i + 1) + ' · ' +
+        z.name + ' · ' + z.lat.toFixed(3) + ', ' + z.lon.toFixed(3);
+
+      const score = document.createElement('div');
+      score.className = 'score';
+      score.textContent = 'Score: ' + z.score.toFixed(1) + '/100';
+
+      const details = document.createElement('small');
+      details.textContent = z.venues + ' venues · '+z.estimated_road_km.toFixed(1)+' km · $'+z.fuel_cost_aud.toFixed(2)+' fuel · ~'+Math.round(z.estimated_travel_minutes)+' min · parking penalty '+Math.round(z.parking_penalty*100)+'%';
+
+      item.append(heading, score, details);
+      item.addEventListener('click', () => {
+        map.setView([z.lat, z.lon], 15);
+      });
+      rankings.appendChild(item);
+    }
+
+}
+
+async function load() {
+ const version = ++loadVersion;
+  status.textContent = 'Calculating zones...';
+  document.getElementById('penalty').textContent = parking.value + '%';
+
+  try {
+    const res = await fetch('/api/zones?' + new URLSearchParams({radius_km:field('radius').value,ignore_distance:field('ignore-distance').checked,include_grocery:field('grocery').checked,day:field('day').value,hour:field('hour').value,parking:parking.value/100,lat:field('lat').value,lon:field('lon').value,fuel_price:field('fuel').value,litres_per_100km:field('consumption').value}));
+    if (!res.ok) throw new Error((await res.json()).error || ('HTTP ' + res.status));
+    const data = await res.json();
+    if (version !== loadVersion) return;
+
+    renderLocation();
+    refreshMapsCache();
+    currentVenues = data.venues || [];
+
+    status.textContent = data.selected_local_datetime + ' (Melbourne) · ' + data.total_venues +
+      ' venues · ' + data.zones.length + ' clusters · ' + (data.stale ? 'OSM cache stale or empty' : 'OSM updated '+new Date(data.updated_at).toLocaleString());
+ field('weather').textContent=data.weather.available ? `Weather: ${data.weather.temperature_c}°C · ${data.weather.precipitation_mm}mm · ${data.weather.wind_kmh}km/h wind${data.weather.stale?' (stale; excluded from scoring)':''} · Open-Meteo` : 'Weather unavailable; neutral scoring.';
+
+    currentZones = data.zones || [];
+    renderClusters();
+
+    renderVenues();
+  } catch (err) {
+    if (version === loadVersion) status.textContent = 'Error: ' + err.message;
+  }
+}
+
+parking.addEventListener('input', () => {
+  document.getElementById('penalty').textContent = parking.value + '%';
+});
+parking.addEventListener('change', load);
+markers.addEventListener('change', renderVenues);
+field('grocery').addEventListener('change', load);
+field('radius').addEventListener('change', load);
+field('ignore-distance').addEventListener('change', load);
+field('min-score').addEventListener('change', renderClusters);
+
+refresh.addEventListener('click', async () => {
+  refresh.disabled = true;
+  status.textContent = 'Fetching OpenStreetMap data...';
+  try {
+    const res = await fetch('/api/refresh', {method: 'POST'});
+    if (!res.ok) throw new Error(await res.text());
+    await load();
+  } catch (err) {
+    status.textContent = 'Refresh failed: ' + err.message;
+  } finally {
+    refresh.disabled = false;
+  }
+});
+
+let mapsCacheVersion = 0;
+let mapsPollTimer;
+let mapsOutcomes = new Map();
+function mapsQuery() {return new URLSearchParams({lat:field('lat').value,lon:field('lon').value});}
+async function refreshMapsCache() {
+  const version = ++mapsCacheVersion;
+  try {
+    const res = await fetch('/api/maps/venues?'+mapsQuery());
+    const data = await res.json();
+    if (!res.ok) throw Error(data.error || 'Could not load Maps cache');
+    if (version !== mapsCacheVersion) return;
+    field('maps-coverage').textContent = `${data.total} cached OSM venues within ${data.radius_km} km of ${data.origin.lat.toFixed(4)}, ${data.origin.lon.toFixed(4)} (food and grocery shops). ${data.osm_stale ? 'OSM cache is stale or empty; refresh OSM for current coverage.' : 'Coverage is limited to the cached Melbourne venues.'}`;
+    const container = field('maps-results');
+    container.replaceChildren();
+    for (const v of data.venues) {
+      const row = document.createElement('details');
+      const heading = document.createElement('summary');
+      const cache = v.google_maps;
+      heading.textContent = `${v.name} · ${v.distance_km.toFixed(1)} km · ${cache ? 'cached Maps record' : 'not collected'}`;
+      row.append(heading);
+      const add = text => {const p=document.createElement('p');p.textContent=text;row.append(p);};
+      const outcome = mapsOutcomes.get(v.key);
+      if (outcome?.error) add('Last collection: '+outcome.error);
+      if (cache) {
+        const o = cache.observation;
+        add('Fresh Google Maps opening hours inform scoring; busy labels remain source observations. Source: '+(o.title || cache.venue.name));
+        add('Busy times collected: '+(cache.busy_fetched_at ? new Date(cache.busy_fetched_at).toLocaleString() : 'unavailable'));
+        for (const day of o.busy || []) add((day.day || 'Day unidentified')+': '+day.labels.join(' · '));
+        add('Opening hours collected: '+(cache.hours_fetched_at ? new Date(cache.hours_fetched_at).toLocaleString() : 'unavailable'));
+        for (const hours of o.opening_hours || []) add(hours.day+': '+hours.text);
+        if (cache.last_error) add('Last attempt: '+cache.last_error+'; retained data may be older.');
+        const link=document.createElement('a');link.href=cache.venue.maps_url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open source in Google Maps';row.append(link);
+      }
+      container.append(row);
+    }
+  } catch (err) {if (version===mapsCacheVersion) field('maps-coverage').textContent=err.message;}
+}
+async function pollMapsJob() {
+  clearTimeout(mapsPollTimer);
+  try {
+    const res=await fetch('/api/maps/job');
+    const job=await res.json();
+    if (!res.ok) throw Error(job.error || 'Cannot read collection status');
+    const active=job.state==='running';
+    field('maps-collect').disabled=active;
+    field('maps-cancel').disabled=!active;
+    mapsOutcomes=new Map((job.results || []).map(r=>[r.key,r]));
+    if (job.state!=='idle') {
+      const issues=(job.results || []).filter(r=>r.error).length;
+      field('maps-progress').textContent=`${job.state}: ${job.completed}/${job.total} processed, ${issues} failed or partial · origin ${job.origin.lat.toFixed(4)}, ${job.origin.lon.toFixed(4)} · ${job.radius_km} km${job.current ? ' · '+job.current : ''}${job.error ? ' · '+job.error : ''}`;
+    }
+    if (active) mapsPollTimer=setTimeout(pollMapsJob,2000);
+    else await refreshMapsCache();
+  } catch (err) {
+    field('maps-progress').textContent=err.message;
+    mapsPollTimer=setTimeout(pollMapsJob,5000);
+  }
+}
+field('maps-collect').onclick=async()=>{
+  field('maps-collect').disabled=true;
+  try {
+    const res=await fetch('/api/maps/collect?'+mapsQuery(),{method:'POST'});
+    const data=await res.json();
+    if (!res.ok) throw Error(data.error || 'Cannot start collection');
+    await pollMapsJob();
+  } catch (err) {field('maps-progress').textContent=err.message;field('maps-collect').disabled=false;}
+};
+field('maps-cancel').onclick=async()=>{
+  try {const res=await fetch('/api/maps/job',{method:'DELETE'});if(!res.ok)throw Error('Could not cancel collection');await pollMapsJob();}
+  catch(err){field('maps-progress').textContent=err.message;}
+};
+field('maps-cached').onclick=refreshMapsCache;
+pollMapsJob();
+load();
+</script>
+</body>
+</html>

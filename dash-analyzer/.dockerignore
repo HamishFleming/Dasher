@@ -1,0 +1,8 @@
+.git
+data
+bin
+*.db*
+frontend/node_modules
+frontend/.next
+frontend/*.tsbuildinfo
+frontend/.env*

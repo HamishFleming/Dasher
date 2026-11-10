@@ -1,0 +1,23 @@
+services:
+  analyzer:
+    build: .
+    volumes:
+      - analyzer-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  frontend:
+    build: ./frontend
+    environment:
+      GO_API_URL: http://analyzer:8080
+    ports:
+      - "127.0.0.1:8080:3000"
+    depends_on:
+      analyzer:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  analyzer-data:

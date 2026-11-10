@@ -1,0 +1,1406 @@
+package openhours
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"math/bits"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+	"unsafe"
+)
+
+const (
+	minutesPerWeek = 10080
+	hasMonotonic   = 1 << 63
+	nsecShift      = 30
+	nsecMask       = (1 << nsecShift) - 1
+	internalToUnix = -62135596800
+
+	// wallToInternal converts the packed wall-clock seconds field (seconds since
+	// 1885-01-01, used when the monotonic bit is set) into the internal epoch
+	// (seconds since year 1). It mirrors time's own wallToInternal.
+	wallToInternal = (1884*365 + 1884/4 - 1884/100 + 1884/400) * 86400
+)
+
+type timeRepr struct {
+	wall uint64
+	ext  int64
+	loc  *time.Location
+}
+
+var (
+	internMu        sync.RWMutex
+	internPool      = make(map[string]*OpeningHours)
+	zeroDuration    time.Duration
+	weekdayToDayIdx = [7]int{6, 0, 1, 2, 3, 4, 5} // Sunday (0) -> 6, Monday (1) -> 0, ...
+
+	emptyOH      = &OpeningHours{expression: "", windows: nil, plainText: true}
+	alwaysOpenOH = makeAlwaysOpenOH()
+
+	// l1Cache is a small, lock-free one-slot cache of the most recently resolved
+	// expression, so that hot repeated parses skip the RWMutex and hash lookup.
+	// It is safe for concurrent use (atomic pointer publication).
+	l1Cache atomic.Pointer[parseSlot]
+
+	// parseCache is a lock-free, direct-mapped cache of resolved expressions.
+	// It spreads interned lookups over many slots so that a working set of
+	// distinct-but-recursively-queried expressions (e.g. a cycle of schedule
+	// strings) resolves without taking internMu or allocating a fresh slot on
+	// every call. It stores the *same* interned pointer that internPool holds,
+	// so interning identity is preserved.
+	parseCache [parseCacheSize]atomic.Pointer[parseSlot]
+)
+
+const (
+	parseCacheSize = 1024 // power of two
+	parseCacheMask = parseCacheSize - 1
+)
+
+// hashString is a cheap, allocation-free hash used only to pick a slot in
+// parseCache. Hash quality affects only the hit rate (collisions merely fall
+// back to internPool), never correctness, since entries are verified by a full
+// string comparison.
+//
+// For strings of at least 8 bytes it reads only the first and last 8 bytes
+// (plus the length), so the cost is constant regardless of expression length —
+// a long expression hashes as fast as a short one. Shorter strings fall back to
+// a byte-wise accumulation.
+func hashString(s string) uint64 {
+	const (
+		mul = 0x9e3779b97f4a7c15
+		mix = 0x9E3779B185EBCA87
+	)
+	n := len(s)
+	if n >= 8 {
+		p := unsafe.Pointer(unsafe.StringData(s))
+		a := *(*uint64)(p)
+		b := *(*uint64)(unsafe.Add(p, n-8))
+		h := (a*mix ^ bits.RotateLeft64(b, 31) ^ uint64(n)*mul)
+		h ^= h >> 29
+		h *= mul
+		h ^= h >> 32
+		return h
+	}
+	var t uint64
+	for i := 0; i < n; i++ {
+		t = t<<8 | uint64(s[i])
+	}
+	h := (t ^ uint64(n)) * mul
+	h ^= h >> 32
+	return h
+}
+
+type parseSlot struct {
+	expr string
+	oh   *OpeningHours
+}
+
+func makeAlwaysOpenOH() *OpeningHours {
+	oh := &OpeningHours{
+		expression: "24/7",
+		windows:    []TimeWindow{{Start: 0, End: minutesPerWeek}},
+		plainText:  true,
+	}
+	for i := range oh.bitmask {
+		oh.bitmask[i] = ^uint64(0)
+	}
+	return oh
+}
+
+// TimeWindow represents a minute interval [Start, End) within a week (0 to 10080 minutes).
+// Monday 00:00 is minute 0, and Sunday 24:00 is minute 10080.
+type TimeWindow struct {
+	Start int
+	End   int
+}
+
+// OpeningHours is an immutable, interval-math based evaluator for OSM opening_hours expressions.
+// It supports overnight shifts, off/closed overrides, 24/7, open-ended ranges, and multi-interval rules.
+type OpeningHours struct {
+	expression string
+	windows    []TimeWindow
+	bitmask    [158]uint64
+	// winBase is a precomputed search accelerator for the (sorted, disjoint)
+	// windows slice: winBase[w] is the number of windows whose End is <= w*64,
+	// i.e. a lower bound on findFirstWindowStartingAtOrAfter(t) for every
+	// t in [w*64, w*64+63]. It turns the branchy binary search into one table
+	// load plus at most a couple of comparisons. It is derived data only:
+	// it is never consulted for the query result, only to skip windows that
+	// provably cannot be the answer.
+	winBase [158]uint8
+	// plainText reports whether expression contains no JSON escape-triggering
+	// bytes (no backslash and no control character). It lets DecodeJSON skip
+	// the escape scan when a cached expression already matches the raw JSON
+	// bytes, which implies the bytes need no unescaping.
+	plainText bool
+}
+
+// Parse parses an OSM opening_hours expression string and returns an *OpeningHours instance.
+// If the expression is invalid or empty, it returns a safe instance with empty schedule (IsOpen = false).
+// Identical expressions are interned to conserve memory.
+func Parse(expression string) *OpeningHours {
+	if expression == "" {
+		return emptyOH
+	}
+	if expression == "24/7" {
+		return alwaysOpenOH
+	}
+
+	slot := l1Cache.Load()
+	if slot != nil {
+		if unsafe.StringData(slot.expr) == unsafe.StringData(expression) && len(slot.expr) == len(expression) {
+			return slot.oh
+		}
+		if slot.expr == expression {
+			return slot.oh
+		}
+	}
+
+	// Second-level direct-mapped cache: absorbs a working set of distinct
+	// expressions that the one-slot l1Cache cannot hold, without the RWMutex or
+	// the per-hit parseSlot allocation the internPool path incurs.
+	cslot := &parseCache[hashString(expression)&parseCacheMask]
+	if s := cslot.Load(); s != nil && s.expr == expression {
+		l1Cache.Store(s)
+		return s.oh
+	}
+
+	return parseSlow(expression, cslot)
+}
+
+// parseSlow holds the cold path (intern-pool probes and the actual parse). It
+// is a separate function so the large `rulesBuf` scratch array no longer sizes
+// Parse's stack frame on the hot cache-hit path.
+func parseSlow(expression string, cslot *atomic.Pointer[parseSlot]) *OpeningHours {
+	internMu.RLock()
+	cached, ok := internPool[expression]
+	internMu.RUnlock()
+	if ok {
+		ps := &parseSlot{expression, cached}
+		cslot.Store(ps)
+		l1Cache.Store(ps)
+		return cached
+	}
+
+	trimmed := strings.TrimSpace(expression)
+
+	internMu.Lock()
+	defer internMu.Unlock()
+	if cached, ok := internPool[expression]; ok {
+		ps := &parseSlot{expression, cached}
+		cslot.Store(ps)
+		l1Cache.Store(ps)
+		return cached
+	}
+
+	var oh *OpeningHours
+	switch {
+	case trimmed == "":
+		oh = emptyOH
+	case trimmed == "24/7":
+		oh = alwaysOpenOH
+	default:
+		var rulesBuf [8]openingRule
+		rules := rulesBuf[:0]
+
+		remaining := trimmed
+		for len(remaining) > 0 {
+			var part string
+			if idx := strings.IndexByte(remaining, ';'); idx >= 0 {
+				part = remaining[:idx]
+				remaining = remaining[idx+1:]
+			} else {
+				part = remaining
+				remaining = ""
+			}
+			part = strings.TrimSpace(part)
+			if part != "" {
+				rule := parseOpeningRule(part)
+				if rule.DayMask > 0 && (rule.IsAllDay || rule.hasRanges()) {
+					rules = append(rules, rule)
+				}
+			}
+		}
+		windows := bakeRules(rules)
+		bm := bakeBitmask(windows)
+		oh = &OpeningHours{
+			expression: expression,
+			windows:    windows,
+			bitmask:    bm,
+			winBase:    bakeWinBase(windows),
+			plainText:  isPlainJSON(expression),
+		}
+	}
+
+	internPool[expression] = oh
+	ps := &parseSlot{expression, oh}
+	cslot.Store(ps)
+	l1Cache.Store(ps)
+	return oh
+}
+
+func bakeBitmask(windows []TimeWindow) [158]uint64 {
+	var bm [158]uint64
+	for _, w := range windows {
+		start := w.Start
+		end := w.End
+		if start < 0 {
+			start = 0
+		}
+		if end > minutesPerWeek {
+			end = minutesPerWeek
+		}
+		if start >= end {
+			continue
+		}
+		startWord := start >> 6
+		endWord := (end - 1) >> 6
+		startBit := start & 63
+		endBit := (end - 1) & 63
+
+		if startWord == endWord {
+			mask := ((uint64(1) << (endBit - startBit + 1)) - 1) << startBit
+			bm[startWord] |= mask
+		} else {
+			bm[startWord] |= (^uint64(0)) << startBit
+			for i := startWord + 1; i < endWord; i++ {
+				bm[i] = ^uint64(0)
+			}
+			bm[endWord] |= (^uint64(0)) >> (63 - endBit)
+		}
+	}
+	return bm
+}
+
+// bakeWinBase builds the window-search accelerator described on OpeningHours.winBase.
+// windows must be sorted by Start (and therefore by End, since they are disjoint).
+func bakeWinBase(windows []TimeWindow) [158]uint8 {
+	var base [158]uint8
+	j := 0
+	for w := 0; w < len(base); w++ {
+		lim := w << 6
+		for j < len(windows) && windows[j].End <= lim {
+			j++
+		}
+		base[w] = uint8(j)
+	}
+	return base
+}
+
+// isPlainJSON reports whether s contains neither a backslash nor a control
+// character, i.e. whether it would survive a JSON string round-trip verbatim.
+// It is evaluated once per unique parsed expression.
+func isPlainJSON(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c < 0x20 {
+			return false
+		}
+	}
+	return true
+}
+
+// Raw returns the raw expression string.
+func (oh *OpeningHours) Raw() string {
+	if oh == nil {
+		return ""
+	}
+	return oh.expression
+}
+
+// String returns the raw expression string.
+func (oh *OpeningHours) String() string {
+	if oh == nil {
+		return ""
+	}
+	return oh.expression
+}
+
+// Windows returns a copy of the disjoint time windows (in week minutes) that comprise the schedule.
+func (oh *OpeningHours) Windows() []TimeWindow {
+	if oh == nil || len(oh.windows) == 0 {
+		return nil
+	}
+	return slices.Clone(oh.windows)
+}
+
+// IsOpen returns true if the specified time is within opening hours.
+func (oh *OpeningHours) IsOpen(t time.Time) bool {
+	// No empty-window guard: an empty schedule has an all-zero bitmask, so the
+	// bit test below already returns false.
+	if oh == nil {
+		return false
+	}
+	tt := (*timeRepr)(unsafe.Pointer(&t))
+	var weekMin int
+	if tt.loc == nil || tt.loc == time.UTC {
+		var unixSec int64
+		if tt.wall&hasMonotonic != 0 {
+			unixSec = int64(tt.wall<<1>>(nsecShift+1)) + internalToUnix
+		} else {
+			unixSec = tt.ext + internalToUnix
+		}
+		if unixSec >= 0 {
+			// Unsigned division by the constant 60 lowers to a single
+			// multiply-shift with no sign correction, unlike the signed form.
+			weekMin = int((uint64(unixSec)/60 + 4320) % minutesPerWeek)
+		} else {
+			weekMin = int((unixSec/60 + 4320) % minutesPerWeek)
+			if weekMin < 0 {
+				weekMin += minutesPerWeek
+			}
+		}
+	} else {
+		weekMin = timeToWeekMinuteNonUTC(t)
+	}
+	return (oh.bitmask[uint(weekMin)>>6] & (uint64(1) << (uint(weekMin) & 63))) != 0
+}
+
+func timeToWeekMinuteNonUTC(t time.Time) int {
+	hour, min, _ := t.Clock()
+	day := weekdayToDayIdx[t.Weekday()]
+	return day*1440 + hour*60 + min
+}
+
+// Match returns true if the time t is within opening hours.
+func (oh *OpeningHours) Match(t time.Time) bool {
+	return oh.IsOpen(t)
+}
+
+// GetCurrentShiftEnd returns the end time of the current open shift if open at t,
+// or nil if currently closed, or nil if open 24/7 (infinite open).
+func (oh *OpeningHours) GetCurrentShiftEnd(t time.Time) *time.Time {
+	if oh == nil || len(oh.windows) == 0 {
+		return nil
+	}
+	if len(oh.windows) == 1 && oh.windows[0].Start == 0 && oh.windows[0].End == minutesPerWeek {
+		return nil
+	}
+
+	min, subMinute := getWeekMinute(t)
+	idx := oh.findFirstWindowStartingAtOrAfter(min)
+	if idx >= len(oh.windows) || oh.windows[idx].Start > min {
+		return nil
+	}
+
+	w := oh.windows[idx]
+	diffMin := w.End - min
+	if idx == len(oh.windows)-1 && w.End == minutesPerWeek && oh.windows[0].Start == 0 {
+		diffMin = (minutesPerWeek - min) + oh.windows[0].End
+	}
+
+	res := addDuration(t, time.Duration(diffMin)*time.Minute-subMinute)
+	return &res
+}
+
+// GetTimeToOpen returns the duration until the next opening window starting from `from`.
+// If currently open, returns 0. If never opens, returns nil.
+func (oh *OpeningHours) GetTimeToOpen(from time.Time) *time.Duration {
+	d, ok := oh.getTimeToOpen(from)
+	if !ok {
+		return nil
+	}
+	if d == 0 {
+		return &zeroDuration
+	}
+	return &d
+}
+
+// TimeToOpen returns the duration until the next opening window starting from `from`,
+// and a boolean indicating whether the location ever opens. If currently open, duration is 0.
+// This is a zero-allocation value method.
+func (oh *OpeningHours) TimeToOpen(from time.Time) (time.Duration, bool) {
+	return oh.getTimeToOpen(from)
+}
+
+func (oh *OpeningHours) getTimeToOpen(from time.Time) (time.Duration, bool) {
+	if oh == nil || len(oh.windows) == 0 {
+		return 0, false
+	}
+	if len(oh.windows) == 1 && oh.windows[0].Start == 0 && oh.windows[0].End == minutesPerWeek {
+		return 0, true
+	}
+
+	t, subMinute := getWeekMinute(from)
+	// winBase turns the window search into one table load plus at most a couple
+	// of comparisons; on every schedule measured this beats a per-minute query
+	// table (which added a second dependent load and a lazily-published
+	// pointer), so the search is the whole hot path.
+	idx := oh.findFirstWindowStartingAtOrAfter(t)
+	if idx < len(oh.windows) {
+		w := oh.windows[idx]
+		if w.Start <= t {
+			return 0, true
+		}
+		d := time.Duration(w.Start-t)*time.Minute - subMinute
+		return d, true
+	}
+	d := time.Duration((minutesPerWeek-t)+oh.windows[0].Start)*time.Minute - subMinute
+	return d, true
+}
+
+// GetTimeToOpenForDuration returns the wait duration from `from` until an opening window
+// that is at least `duration` long begins (or 0 if currently open and remaining continuous slot >= duration).
+// Returns nil if no single opening window in the schedule is long enough.
+func (oh *OpeningHours) GetTimeToOpenForDuration(from time.Time, duration time.Duration) *time.Duration {
+	d, ok := oh.getTimeToOpenForDuration(from, duration)
+	if !ok {
+		return nil
+	}
+	if d == 0 {
+		return &zeroDuration
+	}
+	return &d
+}
+
+// TimeToOpenForDuration returns the wait duration from `from` until an opening window
+// of at least `duration` begins, and a boolean indicating if such a window exists.
+// This is a zero-allocation value method.
+func (oh *OpeningHours) TimeToOpenForDuration(from time.Time, duration time.Duration) (time.Duration, bool) {
+	return oh.getTimeToOpenForDuration(from, duration)
+}
+
+func (oh *OpeningHours) getTimeToOpenForDuration(from time.Time, duration time.Duration) (time.Duration, bool) {
+	if oh == nil || len(oh.windows) == 0 {
+		return 0, false
+	}
+	if duration <= 0 {
+		return 0, true
+	}
+	if duration > time.Duration(minutesPerWeek)*time.Minute {
+		return 0, false
+	}
+	if len(oh.windows) == 1 && oh.windows[0].Start == 0 && oh.windows[0].End == minutesPerWeek {
+		return 0, true
+	}
+
+	t, subMinute := getWeekMinute(from)
+	reqMin := int((duration + time.Minute - 1) / time.Minute)
+	startIdx := oh.findFirstWindowStartingAtOrAfter(t)
+
+	// Check windows in current week starting from t
+	for i := startIdx; i < len(oh.windows); i++ {
+		w := oh.windows[i]
+		effectiveEnd := w.End
+		if i == len(oh.windows)-1 && w.End == minutesPerWeek && oh.windows[0].Start == 0 {
+			effectiveEnd = minutesPerWeek + oh.windows[0].End
+		}
+
+		if t >= w.Start {
+			remDur := time.Duration(effectiveEnd-t)*time.Minute - subMinute
+			if remDur >= duration {
+				return 0, true
+			}
+		} else {
+			if effectiveEnd-w.Start >= reqMin {
+				d := time.Duration(w.Start-t)*time.Minute - subMinute
+				return d, true
+			}
+		}
+	}
+
+	// Wrap around to next week. Windows after startIdx already had their total
+	// duration validated in the first loop above (future-start branch checks
+	// effectiveEnd-w.Start >= reqMin), so only windows [0..startIdx] need to be
+	// re-tested here — notably the currently-open window at startIdx, whose total
+	// length was not validated when only its remaining time was short.
+	for i := 0; i <= startIdx && i < len(oh.windows); i++ {
+		w := oh.windows[i]
+		effectiveEnd := w.End
+		if i == len(oh.windows)-1 && w.End == minutesPerWeek && oh.windows[0].Start == 0 {
+			effectiveEnd = minutesPerWeek + oh.windows[0].End
+		}
+
+		if effectiveEnd-w.Start >= reqMin {
+			d := time.Duration((minutesPerWeek-t)+w.Start)*time.Minute - subMinute
+			return d, true
+		}
+	}
+
+	return 0, false
+}
+
+// When returns the time `from` + wait duration when `duration` can be continuously serviced during open hours,
+// or nil if it never fits.
+func (oh *OpeningHours) When(from time.Time, duration time.Duration) *time.Time {
+	t, ok := oh.WhenTime(from, duration)
+	if !ok {
+		return nil
+	}
+	return &t
+}
+
+// WhenTime returns the time `from` + wait duration when `duration` can be continuously serviced during open hours,
+// and a boolean indicating success. It does not allocate memory on the heap.
+func (oh *OpeningHours) WhenTime(from time.Time, duration time.Duration) (time.Time, bool) {
+	d, ok := oh.getTimeToOpenForDuration(from, duration)
+	if !ok {
+		return time.Time{}, false
+	}
+	if d == 0 {
+		return from, true
+	}
+	return addDuration(from, d), true
+}
+
+// NextDur returns whether currently open, and the duration until state changes (shift ends or opens).
+func (oh *OpeningHours) NextDur(t time.Time) (bool, time.Duration) {
+	if oh == nil || len(oh.windows) == 0 {
+		return false, 0
+	}
+	if len(oh.windows) == 1 && oh.windows[0].Start == 0 && oh.windows[0].End == minutesPerWeek {
+		return true, time.Duration(minutesPerWeek) * time.Minute
+	}
+
+	min, subMinute := getWeekMinute(t)
+	// See getTimeToOpen: winBase makes the search cheap enough that a
+	// per-minute query table is a net loss.
+	idx := oh.findFirstWindowStartingAtOrAfter(min)
+	if idx < len(oh.windows) {
+		w := oh.windows[idx]
+		if w.Start <= min {
+			// Currently open
+			diffMin := w.End - min
+			if idx == len(oh.windows)-1 && w.End == minutesPerWeek && oh.windows[0].Start == 0 {
+				diffMin = (minutesPerWeek - min) + oh.windows[0].End
+			}
+			dur := time.Duration(diffMin)*time.Minute - subMinute
+			return true, dur
+		}
+		// Currently closed, opens at w.Start
+		dur := time.Duration(w.Start-min)*time.Minute - subMinute
+		return false, dur
+	}
+
+	// Currently closed, opens at windows[0].Start next week
+	dur := time.Duration((minutesPerWeek-min)+oh.windows[0].Start)*time.Minute - subMinute
+	return false, dur
+}
+
+// NextDate returns whether currently open, and the time when the status changes.
+func (oh *OpeningHours) NextDate(t time.Time) (bool, time.Time) {
+	isOpen, dur := oh.NextDur(t)
+	return isOpen, addDuration(t, dur)
+}
+
+func (oh *OpeningHours) findFirstWindowStartingAtOrAfter(t int) int {
+	windows := oh.windows
+	n := len(windows)
+	if n == 0 {
+		return 0
+	}
+	// winBase gives a lower bound on the answer for the whole 64-minute word
+	// containing t, so the scan below only re-examines the few windows whose
+	// End actually falls inside (or just after) that word.
+	word := t >> 6
+	if uint(word) >= uint(len(oh.winBase)) {
+		if t < 0 {
+			word = 0
+		} else {
+			word = len(oh.winBase) - 1
+		}
+	}
+	i := int(oh.winBase[word])
+	for ; i < n; i++ {
+		if windows[i].End > t {
+			return i
+		}
+	}
+	return n
+}
+
+// MarshalJSON serializes OpeningHours as a JSON string with its expression.
+func (oh *OpeningHours) MarshalJSON() ([]byte, error) {
+	if oh == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(oh.expression)
+}
+
+// UnmarshalJSON deserializes OpeningHours from a JSON string, without going
+// through encoding/json's reflection-based dispatch in the decode path.
+func (oh *OpeningHours) UnmarshalJSON(data []byte) error {
+	expr, err := decodeExpression(data)
+	if err != nil {
+		return err
+	}
+	// Copy the interned instance's immutable fields by value rather than
+	// assigning *oh = *Parse(expr) so a whole-struct copy never has to be
+	// reasoned about.
+	p := Parse(expr)
+	oh.expression = p.expression
+	oh.windows = p.windows
+	oh.bitmask = p.bitmask
+	oh.winBase = p.winBase
+	oh.plainText = p.plainText
+	return nil
+}
+
+// DecodeJSON parses a JSON string of an opening_hours expression and returns the
+// corresponding *OpeningHours (a shared, interned instance — not a copy). It is a
+// dependency-free, reflection-free decode entry point: the common plain-string
+// case resolves through the lock-free L1 cache with zero allocations, and escaped
+// JSON strings are handled by a small hand-rolled scanner instead of
+// encoding/json.
+func DecodeJSON(data []byte) (*OpeningHours, error) {
+	if n := len(data); n >= 2 && data[0] == '"' && data[n-1] == '"' {
+		inner := data[1 : n-1]
+		// If a cached expression equals the raw bytes *and* is itself known to
+		// be escape-free, then those raw bytes contain no backslash and no
+		// control character: a backslash in the bytes could not equal the
+		// escape-free expression, so unescaping is provably a no-op and the
+		// decode result is exactly that cached expression. Checking the cache
+		// first therefore skips the escape scan on the hot repeated-decode path.
+		if slot := l1Cache.Load(); slot != nil && slot.oh.plainText && stringEqualsBytes(slot.expr, inner) {
+			return slot.oh, nil
+		}
+		if !hasJSONEscape(inner) {
+			return Parse(string(inner)), nil
+		}
+	}
+	expr, err := decodeExpression(data)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(expr), nil
+}
+
+// decodeExpression validates that data is a JSON string and returns the decoded
+// opening_hours expression, handling the standard JSON escapes. It performs no
+// reflection and does not route through encoding/json.
+func decodeExpression(data []byte) (string, error) {
+	n := len(data)
+	if n < 2 || data[0] != '"' {
+		return "", errNotJSONString
+	}
+	// Fast path: a plain quoted string with no escapes.
+	inner := data[1:]
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if c == '\\' || c < 0x20 {
+			return decodeEscaped(data)
+		}
+		if c == '"' {
+			if i == len(inner)-1 {
+				return string(data[1 : n-1]), nil
+			}
+			return "", errNotJSONString
+		}
+	}
+	return "", errNotJSONString
+}
+
+var (
+	errNotJSONString         = errors.New("openhours: invalid character looking for beginning of value")
+	errInvalidUnicode        = errors.New("openhours: invalid unicode escape")
+	errInvalidEscape         = errors.New("openhours: invalid escape")
+	errInvalidControlChar    = errors.New("openhours: invalid control character")
+	errUnexpectedEOFInString = errors.New("openhours: unexpected end of JSON input")
+)
+
+// hasJSONEscape reports whether raw string content contains a backslash or a
+// control character, i.e. input that needs JSON unescaping. It scans 8 bytes at
+// a time using SWAR tricks (no per-byte branches) and falls back to a scalar
+// loop for the tail.
+func hasJSONEscape(s []byte) bool {
+	const (
+		lo = 0x0101010101010101
+		hi = 0x8080808080808080
+	)
+	i := 0
+	for ; i+8 <= len(s); i += 8 {
+		v := binary.LittleEndian.Uint64(s[i : i+8])
+		// Any byte < 0x20 (control char)?
+		if (v-0x2020202020202020)&^v&hi != 0 {
+			return true
+		}
+		// Any byte == '\\' (0x5C)?
+		x := v ^ 0x5C5C5C5C5C5C5C5C
+		if (x-lo)&^x&hi != 0 {
+			return true
+		}
+	}
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c < 0x20 {
+			return true
+		}
+	}
+	return false
+}
+
+// stringEqualsBytes compares a string against a byte slice without allocating.
+// It only reads the string's backing memory (never writes) and never retains the
+// byte slice, so the read-only view is safe.
+func stringEqualsBytes(s string, b []byte) bool {
+	if len(s) != len(b) {
+		return false
+	}
+	if len(b) == 0 {
+		return true
+	}
+	// Compare via a read-only string view of b so the equality test lowers to
+	// runtime.memequal (SIMD on amd64) instead of a scalar byte loop.
+	return s == unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// decodeEscaped unescapes a JSON string that contains backslash escapes.
+func decodeEscaped(data []byte) (string, error) {
+	n := len(data)
+	if n < 2 || data[0] != '"' {
+		return "", errNotJSONString
+	}
+	buf := make([]byte, 0, n-1)
+	i := 1
+	for i < n {
+		c := data[i]
+		switch {
+		case c == '"':
+			return string(buf), nil
+		case c == '\\':
+			if i+1 >= n {
+				return "", errUnexpectedEOFInString
+			}
+			e := data[i+1]
+			switch e {
+			case '"', '\\', '/':
+				buf = append(buf, e)
+				i += 2
+			case 'b':
+				buf = append(buf, '\b')
+				i += 2
+			case 'f':
+				buf = append(buf, '\f')
+				i += 2
+			case 'n':
+				buf = append(buf, '\n')
+				i += 2
+			case 'r':
+				buf = append(buf, '\r')
+				i += 2
+			case 't':
+				buf = append(buf, '\t')
+				i += 2
+			case 'u':
+				if i+6 > n {
+					return "", errUnexpectedEOFInString
+				}
+				r, ok := decodeHex4(data[i+2 : i+6])
+				if !ok {
+					return "", errInvalidUnicode
+				}
+				if r <= 0x7F {
+					buf = append(buf, byte(r))
+				} else {
+					var enc [4]byte
+					m := utf8.EncodeRune(enc[:], r)
+					buf = append(buf, enc[:m]...)
+				}
+				i += 6
+			default:
+				return "", errInvalidEscape
+			}
+		case c < 0x20:
+			return "", errInvalidControlChar
+		default:
+			buf = append(buf, c)
+			i++
+		}
+	}
+	return "", errUnexpectedEOFInString
+}
+
+func decodeHex4(b []byte) (rune, bool) {
+	if len(b) != 4 {
+		return 0, false
+	}
+	var r rune
+	for _, c := range b {
+		r <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			r |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			r |= rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			r |= rune(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	// Reject UTF-16 surrogate halves without a pair and out-of-range values.
+	if r >= 0xD800 && r <= 0xDFFF {
+		return 0, false
+	}
+	if r > 0x10FFFF {
+		return 0, false
+	}
+	return r, true
+}
+
+// addDuration is a drop-in replacement for t.Add(d) that operates on the raw
+// time representation. It reproduces the standard library's algorithm exactly
+// (including its monotonic-clock retention and saturation behaviour) while
+// removing the extra call into time.addSec and the 24-byte Time copy that the
+// stdlib's Add pays on every NextDate/When result. Instants that carry a
+// monotonic clock reading are rare here and take the addDurationMono path.
+func addDuration(t time.Time, d time.Duration) time.Time {
+	tt := (*timeRepr)(unsafe.Pointer(&t))
+	if tt.wall&hasMonotonic != 0 {
+		return addDurationMono(t, d)
+	}
+	// time.Time.Add, sub-second part: fold d's nanoseconds into wall's nsec field.
+	dsec := int64(d / 1e9)
+	nsec := int32(tt.wall&nsecMask) + int32(d%1e9)
+	if nsec >= 1e9 {
+		dsec++
+		nsec -= 1e9
+	} else if nsec < 0 {
+		dsec--
+		nsec += 1e9
+	}
+	tt.wall = tt.wall&^nsecMask | uint64(nsec)
+	// Without a monotonic reading, time.Time.addSec just additively stores into
+	// ext, and the subsequent monotonic refinement is skipped.
+	tt.ext = addDurOverflow(tt.ext, dsec)
+	return t
+}
+
+// addDurationMono handles instants that carry a monotonic clock reading.
+func addDurationMono(t time.Time, d time.Duration) time.Time {
+	tt := (*timeRepr)(unsafe.Pointer(&t))
+	dsec := int64(d / 1e9)
+	nsec := int32(tt.wall&nsecMask) + int32(d%1e9)
+	if nsec >= 1e9 {
+		dsec++
+		nsec -= 1e9
+	} else if nsec < 0 {
+		dsec--
+		nsec += 1e9
+	}
+	tt.wall = tt.wall&^nsecMask | uint64(nsec)
+
+	// time.Time.addSec(dsec).
+	seconds := int64(tt.wall<<1>>(nsecShift+1)) + dsec
+	if 0 <= seconds && seconds <= 1<<33-1 {
+		tt.wall = tt.wall&nsecMask | uint64(seconds)<<nsecShift | hasMonotonic
+	} else {
+		// stripMono: the packed seconds field overflowed, move to ext.
+		tt.ext = wallToInternal + int64(tt.wall<<1>>(nsecShift+1))
+		tt.wall &= nsecMask
+		tt.ext = addDurOverflow(tt.ext, dsec)
+	}
+
+	if tt.wall&hasMonotonic != 0 {
+		te := tt.ext + int64(d)
+		if d < 0 && te > tt.ext || d > 0 && te < tt.ext {
+			// Monotonic reading out of range; degrade to wall-only.
+			tt.ext = wallToInternal + int64(tt.wall<<1>>(nsecShift+1))
+			tt.wall &= nsecMask
+		} else {
+			tt.ext = te
+		}
+	}
+	return t
+}
+
+// addDurOverflow mirrors time's saturating add of ext and d.
+func addDurOverflow(ext, d int64) int64 {
+	sum := ext + d
+	if (sum > ext) == (d > 0) {
+		return sum
+	}
+	if d > 0 {
+		return 1<<63 - 1
+	}
+	return -(1<<63 - 1)
+}
+
+// getWeekMinute returns the minute within the week (Monday 00:00 == 0) and the
+// sub-minute remainder of dt. The UTC fast path keeps the division unsigned,
+// which the compiler lowers to a single multiply-shift without sign fix-ups.
+func getWeekMinute(dt time.Time) (int, time.Duration) {
+	tt := (*timeRepr)(unsafe.Pointer(&dt))
+	if tt.loc == nil || tt.loc == time.UTC {
+		var unixSec, nsec int64
+		if tt.wall&hasMonotonic != 0 {
+			nsec = int64(tt.wall & nsecMask)
+			unixSec = int64(tt.wall<<1>>(nsecShift+1)) + internalToUnix
+		} else {
+			nsec = int64(tt.wall)
+			unixSec = tt.ext + internalToUnix
+		}
+		if unixSec >= 0 {
+			u := uint64(unixSec)
+			q := u / 60
+			return int((q + 4320) % minutesPerWeek), time.Duration(u-q*60)*time.Second + time.Duration(nsec)
+		}
+		q := unixSec / 60
+		weekMin := int((q + 4320) % minutesPerWeek)
+		if weekMin < 0 {
+			weekMin += minutesPerWeek
+		}
+		return weekMin, time.Duration(unixSec-q*60)*time.Second + time.Duration(nsec)
+	}
+	return getWeekMinuteNonUTC(dt)
+}
+
+func getWeekMinuteNonUTC(dt time.Time) (int, time.Duration) {
+	hour, min, sec := dt.Clock()
+	day := weekdayToDayIdx[dt.Weekday()]
+	subMinute := time.Duration(sec)*time.Second + time.Duration(dt.Nanosecond())
+	return day*1440 + hour*60 + min, subMinute
+}
+
+type timeRange struct {
+	StartMin  int16
+	EndMin    int16
+	DayOffset int8
+}
+
+type openingRule struct {
+	DayMask     uint8
+	IsOff       bool
+	IsAllDay    bool
+	NumRanges   uint8
+	TimeRanges  [4]timeRange
+	ExtraRanges []timeRange
+}
+
+func (r *openingRule) addRange(tr timeRange) {
+	if r.NumRanges < 4 {
+		r.TimeRanges[r.NumRanges] = tr
+		r.NumRanges++
+	} else {
+		r.ExtraRanges = append(r.ExtraRanges, tr)
+	}
+}
+
+func (r *openingRule) hasRanges() bool {
+	return r.NumRanges > 0 || len(r.ExtraRanges) > 0
+}
+
+func hasSuffixFold(s, suffix string) bool {
+	if len(s) < len(suffix) {
+		return false
+	}
+	s = s[len(s)-len(suffix):]
+	for i := 0; i < len(suffix); i++ {
+		c1 := s[i]
+		c2 := suffix[i]
+		if c1 != c2 {
+			if c1 >= 'A' && c1 <= 'Z' {
+				c1 += 'a' - 'A'
+			}
+			if c2 >= 'A' && c2 <= 'Z' {
+				c2 += 'a' - 'A'
+			}
+			if c1 != c2 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func equalFoldASCII(s, target string) bool {
+	if len(s) != len(target) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c1 := s[i]
+		c2 := target[i]
+		if c1 != c2 {
+			if c1 >= 'A' && c1 <= 'Z' {
+				c1 += 'a' - 'A'
+			}
+			if c2 >= 'A' && c2 <= 'Z' {
+				c2 += 'a' - 'A'
+			}
+			if c1 != c2 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseOpeningRule(ruleString string) openingRule {
+	var rule openingRule
+
+	if hasSuffixFold(ruleString, " off") {
+		rule.IsOff = true
+		ruleString = trimSpaceFast(ruleString[:len(ruleString)-4])
+	} else if hasSuffixFold(ruleString, " closed") {
+		rule.IsOff = true
+		ruleString = trimSpaceFast(ruleString[:len(ruleString)-7])
+	} else if hasSuffixFold(ruleString, " open") {
+		ruleString = trimSpaceFast(ruleString[:len(ruleString)-5])
+	} else if equalFoldASCII(ruleString, "off") || equalFoldASCII(ruleString, "closed") {
+		rule.IsOff = true
+		rule.DayMask = 0x7F
+		rule.IsAllDay = true
+		return rule
+	} else if equalFoldASCII(ruleString, "open") || ruleString == "24/7" {
+		rule.DayMask = 0x7F
+		rule.IsAllDay = true
+		return rule
+	}
+
+	ruleString = trimSpaceFast(ruleString)
+	if ruleString == "" {
+		return rule
+	}
+
+	// Find the first ASCII digit which begins the time specification
+	digitIdx := -1
+	for i := 0; i < len(ruleString); i++ {
+		if ruleString[i] >= '0' && ruleString[i] <= '9' {
+			digitIdx = i
+			break
+		}
+	}
+
+	var dayPart, timePart string
+	if digitIdx >= 0 {
+		dayPart = trimSpaceFast(ruleString[:digitIdx])
+		timePart = trimSpaceFast(ruleString[digitIdx:])
+	} else {
+		dayPart = ruleString
+		timePart = ""
+	}
+
+	if dayPart != "" {
+		dayMask := parseDayMask(dayPart)
+		if dayMask == 0 {
+			return rule
+		}
+		rule.DayMask = uint8(dayMask)
+	} else {
+		rule.DayMask = 0x7F // All 7 days
+	}
+
+	if timePart != "" {
+		parseTimesToRule(timePart, &rule)
+		rule.IsAllDay = false
+	} else {
+		rule.IsAllDay = true
+	}
+
+	return rule
+}
+
+func parseDayMask(dayPart string) int {
+	mask := 0
+	remaining := dayPart
+	for len(remaining) > 0 {
+		var group string
+		if idx := strings.IndexByte(remaining, ','); idx >= 0 {
+			group = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			group = remaining
+			remaining = ""
+		}
+		group = trimSpaceFast(group)
+		if group == "" {
+			continue
+		}
+		if dashIdx := strings.IndexByte(group, '-'); dashIdx >= 0 {
+			rangePart1 := trimSpaceFast(group[:dashIdx])
+			rangePart2 := trimSpaceFast(group[dashIdx+1:])
+			start := dayToIndex(rangePart1)
+			end := dayToIndex(rangePart2)
+			if start != -1 && end != -1 {
+				for curr := start; ; curr = (curr + 1) % 7 {
+					mask |= (1 << curr)
+					if curr == end {
+						break
+					}
+				}
+			} else {
+				return 0
+			}
+		} else {
+			idx := dayToIndex(group)
+			if idx != -1 {
+				mask |= (1 << idx)
+			} else {
+				return 0
+			}
+		}
+	}
+	return mask
+}
+
+func trimSpaceFast(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func dayToIndex(s string) int {
+	s = trimSpaceFast(s)
+	if len(s) < 2 {
+		return -1
+	}
+	c0 := s[0] | 0x20
+	c1 := s[1] | 0x20
+	pair := (uint16(c0) << 8) | uint16(c1)
+
+	switch pair {
+	case ('m' << 8) | 'o':
+		if len(s) == 2 || equalFoldASCII(s, "mon") || equalFoldASCII(s, "monday") {
+			return 0
+		}
+	case ('t' << 8) | 'u':
+		if len(s) == 2 || equalFoldASCII(s, "tue") || equalFoldASCII(s, "tues") || equalFoldASCII(s, "tuesday") {
+			return 1
+		}
+	case ('w' << 8) | 'e':
+		if len(s) == 2 || equalFoldASCII(s, "wed") || equalFoldASCII(s, "wednesday") {
+			return 2
+		}
+	case ('t' << 8) | 'h':
+		if len(s) == 2 || equalFoldASCII(s, "thu") || equalFoldASCII(s, "thur") || equalFoldASCII(s, "thurs") || equalFoldASCII(s, "thursday") {
+			return 3
+		}
+	case ('f' << 8) | 'r':
+		if len(s) == 2 || equalFoldASCII(s, "fri") || equalFoldASCII(s, "friday") {
+			return 4
+		}
+	case ('s' << 8) | 'a':
+		if len(s) == 2 || equalFoldASCII(s, "sat") || equalFoldASCII(s, "saturday") {
+			return 5
+		}
+	case ('s' << 8) | 'u':
+		if len(s) == 2 || equalFoldASCII(s, "sun") || equalFoldASCII(s, "sunday") {
+			return 6
+		}
+	}
+	return -1
+}
+
+func parseTimesToRule(timePart string, rule *openingRule) {
+	remaining := timePart
+	for len(remaining) > 0 {
+		var group string
+		if idx := strings.IndexByte(remaining, ','); idx >= 0 {
+			group = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			group = remaining
+			remaining = ""
+		}
+		group = trimSpaceFast(group)
+		if group == "" {
+			continue
+		}
+		if group == "24/7" || group == "00:00-24:00" || group == "00:00-00:00" {
+			rule.addRange(timeRange{StartMin: 0, EndMin: 1440, DayOffset: 0})
+		} else if dashIdx := strings.IndexByte(group, '-'); dashIdx >= 0 {
+			part1 := group[:dashIdx]
+			part2 := group[dashIdx+1:]
+			s, ok1 := tryParseTimeMin(part1)
+			e, ok2 := tryParseTimeMin(part2)
+			if ok1 && ok2 {
+				if s == 0 && e == 0 {
+					rule.addRange(timeRange{StartMin: 0, EndMin: 1440, DayOffset: 0})
+				} else if s < e {
+					rule.addRange(timeRange{StartMin: int16(s), EndMin: int16(e), DayOffset: 0})
+				} else if s > e {
+					rule.addRange(timeRange{StartMin: int16(s), EndMin: 1440, DayOffset: 0})
+					rule.addRange(timeRange{StartMin: 0, EndMin: int16(e), DayOffset: 1})
+				}
+			}
+		} else if strings.HasSuffix(group, "+") {
+			sOnly, ok := tryParseTimeMin(group[:len(group)-1])
+			if ok {
+				rule.addRange(timeRange{StartMin: int16(sOnly), EndMin: 1440, DayOffset: 0})
+			}
+		}
+	}
+}
+
+func tryParseTimeMin(s string) (int, bool) {
+	s = trimSpaceFast(s)
+	if s == "24:00" {
+		return 1440, true
+	}
+	n := len(s)
+	// Fast path for standard "HH:MM" (5 bytes)
+	if n == 5 && s[2] == ':' {
+		h0, h1, m0, m1 := s[0]-'0', s[1]-'0', s[3]-'0', s[4]-'0'
+		if h0 < 10 && h1 < 10 && m0 < 10 && m1 < 10 {
+			h := int(h0*10 + h1)
+			m := int(m0*10 + m1)
+			if h < 24 && m < 60 {
+				return h*60 + m, true
+			}
+		}
+		return 0, false
+	}
+	// Fast path for standard "H:MM" (4 bytes)
+	if n == 4 && s[1] == ':' {
+		h0, m0, m1 := s[0]-'0', s[2]-'0', s[3]-'0'
+		if h0 < 10 && m0 < 10 && m1 < 10 {
+			m := int(m0*10 + m1)
+			if m < 60 {
+				return int(h0)*60 + m, true
+			}
+		}
+		return 0, false
+	}
+
+	colonIdx := strings.IndexByte(s, ':')
+	if colonIdx < 1 || colonIdx >= len(s)-1 {
+		return 0, false
+	}
+	h, ok1 := parseTwoDigits(s[:colonIdx])
+	m, ok2 := parseTwoDigits(s[colonIdx+1:])
+	if ok1 && ok2 && h >= 0 && h < 24 && m >= 0 && m < 60 {
+		return h*60 + m, true
+	}
+	return 0, false
+}
+
+func parseTwoDigits(s string) (int, bool) {
+	s = trimSpaceFast(s)
+	switch len(s) {
+	case 1:
+		if s[0] >= '0' && s[0] <= '9' {
+			return int(s[0] - '0'), true
+		}
+	case 2:
+		c0, c1 := s[0], s[1]
+		if c0 >= '0' && c0 <= '9' && c1 >= '0' && c1 <= '9' {
+			return int(c0-'0')*10 + int(c1-'0'), true
+		}
+	}
+	return 0, false
+}
+
+func bakeRules(rules []openingRule) []TimeWindow {
+	var openBuf [32]TimeWindow
+	openIntervals := openBuf[:0]
+
+	var ruleBuf [16]TimeWindow
+
+	for _, rule := range rules {
+		ruleWindows := ruleBuf[:0]
+		for day := 0; day < 7; day++ {
+			if (rule.DayMask & (1 << day)) == 0 {
+				continue
+			}
+
+			if rule.IsAllDay {
+				dayOffset := day * 1440
+				ruleWindows = append(ruleWindows, TimeWindow{Start: dayOffset, End: dayOffset + 1440})
+			} else {
+				n := int(rule.NumRanges)
+				if n > 4 {
+					n = 4
+				}
+				for k := 0; k < n; k++ {
+					tr := rule.TimeRanges[k]
+					targetDay := (day + int(tr.DayOffset)) % 7
+					dayOffset := targetDay * 1440
+					ruleWindows = append(ruleWindows, TimeWindow{
+						Start: dayOffset + int(tr.StartMin),
+						End:   dayOffset + int(tr.EndMin),
+					})
+				}
+				for _, tr := range rule.ExtraRanges {
+					targetDay := (day + int(tr.DayOffset)) % 7
+					dayOffset := targetDay * 1440
+					ruleWindows = append(ruleWindows, TimeWindow{
+						Start: dayOffset + int(tr.StartMin),
+						End:   dayOffset + int(tr.EndMin),
+					})
+				}
+			}
+		}
+
+		if !rule.IsOff {
+			openIntervals = append(openIntervals, ruleWindows...)
+			openIntervals = mergeWindowsInPlace(openIntervals)
+		} else {
+			openIntervals = subtractWindowsInPlace(openIntervals, ruleWindows)
+		}
+	}
+
+	sortWindows(openIntervals)
+	if len(openIntervals) == 0 {
+		return nil
+	}
+	res := make([]TimeWindow, len(openIntervals))
+	copy(res, openIntervals)
+	return res
+}
+
+func sortWindows(intervals []TimeWindow) {
+	for i := 1; i < len(intervals); i++ {
+		for j := i; j > 0 && intervals[j].Start < intervals[j-1].Start; j-- {
+			intervals[j], intervals[j-1] = intervals[j-1], intervals[j]
+		}
+	}
+}
+
+func mergeWindowsInPlace(intervals []TimeWindow) []TimeWindow {
+	if len(intervals) <= 1 {
+		return intervals
+	}
+	sortWindows(intervals)
+
+	wIdx := 0
+	for i := 1; i < len(intervals); i++ {
+		curr := intervals[i]
+		if curr.Start <= intervals[wIdx].End {
+			if curr.End > intervals[wIdx].End {
+				intervals[wIdx].End = curr.End
+			}
+		} else {
+			wIdx++
+			intervals[wIdx] = curr
+		}
+	}
+	return intervals[:wIdx+1]
+}
+
+func subtractWindowsInPlace(source []TimeWindow, subtrahends []TimeWindow) []TimeWindow {
+	subs := mergeWindowsInPlace(subtrahends)
+
+	var nextBuf [32]TimeWindow
+	for _, sub := range subs {
+		nextCount := 0
+		for _, s := range source {
+			if sub.Start >= s.End || sub.End <= s.Start {
+				if nextCount < len(nextBuf) {
+					nextBuf[nextCount] = s
+					nextCount++
+				}
+			} else {
+				if sub.Start > s.Start && nextCount < len(nextBuf) {
+					nextBuf[nextCount] = TimeWindow{Start: s.Start, End: sub.Start}
+					nextCount++
+				}
+				if sub.End < s.End && nextCount < len(nextBuf) {
+					nextBuf[nextCount] = TimeWindow{Start: sub.End, End: s.End}
+					nextCount++
+				}
+			}
+		}
+		source = append(source[:0], nextBuf[:nextCount]...)
+	}
+	return source
+}
+
