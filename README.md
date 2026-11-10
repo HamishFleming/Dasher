@@ -6,8 +6,8 @@ Built with **Next.js, React, TypeScript, Go and SQLite**, with Leaflet maps, Ope
 
 > Scores are planning heuristics, not live DoorDash demand, confirmed platform participation, order predictions or promised income. This project has no DoorDash integration.
 
-[Dashboard](images/Screenshot%202026-11-10%20at%2022-53-19%20Explore%20·%20Dash%20Analyzer.png)
-![Dash Analyzer Explore dashboard](images/Screenshot%202026-11-10%20at%2022-51-39%20Explore%20%C2%B7%20Dash%20Analyzer.png)
+![Dashboard](images/Screenshot%202026-11-10%20at%2022-53-19%20Explore%20·%20Dash%20Analyzer.png)
+<!-- ![Dash Analyzer Explore dashboard](images/Screenshot%202026-11-10%20at%2022-51-39%20Explore%20%C2%B7%20Dash%20Analyzer.png) -->
 
 ## Quickstart / Demo
 
